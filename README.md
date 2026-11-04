@@ -104,9 +104,9 @@ pip install -r requirements.txt
 ```
 
 Tested with Python 3.9, PyTorch 2.0.0, CUDA 11.8, xFormers 0.0.19 on 4x NVIDIA RTX A6000.
-xFormers is **required**: the temporal-RoPE attention used by the SLiM encoder is implemented
-only on top of `xformers.ops.memory_efficient_attention`, which is CUDA-only. There is no CPU
-path — run the model on a GPU. Loading weights from HuggingFace Hub additionally needs
+xFormers is optional: without it the temporal-RoPE attention falls back to PyTorch
+`scaled_dot_product_attention` (same math), and the code also runs on PyTorch >= 2.1 (FSDP
+stream / reshard API changes are handled). Loading weights from HuggingFace Hub additionally needs
 `pip install huggingface_hub safetensors`.
 
 ## Data
@@ -258,6 +258,123 @@ the recipe**: linear evaluation uses 4 GPUs x batch 16, semi-supervised fine-tun
 batch 128. The default GPU lists in the scripts already match; change them and the effective
 learning rates change with them.
 
+## Sign-language pose (RTMPose, Uni-Sign layout)
+
+The same framework runs on 2D sign-language pose: RTMPose COCO-WholeBody-133 keypoints as used
+by Uni-Sign (CSL-Daily, WLASL, How2Sign, OpenASL pose pickles). Nothing changes on the NTU path.
+
+| | NTU (original) | Sign pose |
+| --- | --- | --- |
+| Joints | Kinect-25, 3D | 69 = body 9 + hands 2 x 21 + face 18 (`sign69`), or 51 without face (`sign51`) |
+| Channels | x, y, z | x, y, RTMPose score (missing joints are all-zero) |
+| Normalisation | origin at spine | Uni-Sign `load_part_kp`: body in its bbox, hands wrist-relative, face nose-relative (`pose_norm: part`), or one body-bbox frame (`global`) |
+| Token grid | 64 frames, P_T = 8 -> 8 x 25 | 64 frames, P_T = 4 -> 16 x 69 |
+| STM groups | trunk, arms, legs | head, 2 arms, 2 hands (COCO finger order), jaw, mouth; groups drawn with sqrt(size) weights so every part gets the target mask rate |
+| SAA | 3D rotation, limb scaling, L/R mirror | in-plane rotation (+-0.2 rad), bone scaling on hand / arm / face trees, L/R mirror incl. hands and face contour; part-drop (a hand or the face) replaces axis-drop |
+| Long clips | - | the two global views come from one random <= 128-frame window (`crops.max_window_frames`) |
+| MFP prototypes | 65,536 | 16,384 (1,104 tokens per view) |
+| Downstream | NTU-60/120 | WLASL-2000 linear / semi / k-NN (classifier picked on dev, reported on test) |
+
+The encoder is the same `vit_tiny` (6.38 M parameters); temporal positions are RoPE, so it also
+takes full-length clips (any multiple of P_T frames) at inference.
+
+**Environment.** On top of an existing PyTorch env (e.g. Uni-Sign's torch 2.1), without touching it:
+
+```bash
+python -m venv --system-site-packages .venv
+.venv/bin/pip install omegaconf==2.3.0 fvcore==0.1.5.post20221221 torchmetrics==0.10.3
+printf '#!/bin/sh\nexec "$(dirname "$0")/python" -m torch.distributed.run "$@"\n' > .venv/bin/torchrun
+chmod +x .venv/bin/torchrun && source .venv/bin/activate
+```
+
+**Data.** Pack each split once into a memory-mapped `data/sign/<dataset>/<split>/` (paths default
+to the Uni-Sign repo layout, `--unisign-root` / `--labels` / `--poses` override them):
+
+```bash
+for sp in train dev test; do python tools/pack_sign_poses.py --dataset WLASL --split $sp; done      # 2000 classes
+for sp in train dev test; do python tools/pack_sign_poses.py --dataset CSL_Daily --split $sp; done
+python tools/pack_sign_poses.py --dataset How2Sign --split train
+python tools/pack_sign_poses.py --dataset OpenASL --split train
+```
+
+**Pre-training** (training clips only, no labels / text):
+
+```bash
+scripts/pretrain_sign.sh wlasl     outputs/slim_sign_wlasl  0,1,2,3   # WLASL train
+scripts/pretrain_sign.sh csl_daily outputs/slim_sign_csl    0,1,2,3   # CSL-Daily train
+scripts/pretrain_sign.sh openasl   outputs/slim_sign_openasl 0,1,2,3  # OpenASL train
+scripts/pretrain_sign.sh asl       outputs/slim_sign_asl    0,1,2,3   # How2Sign + OpenASL + WLASL train
+```
+
+The configs use 64 clips per GPU: peak memory grows ~0.58 GB per clip at the default grid
+(measured at batch 8 / 16 on an L40S), so ~38 GB at 64. With less memory lower
+`train.batch_size_per_gpu` (the LR follows the sqrt rule), or use `student.patch_size=[8,1]` for the
+paper's 8 x V grid at about half the cost.
+
+Enable Weights & Biases logging with the optional `wandb` package installed and an account
+logged in (`python -m wandb login`):
+
+```bash
+scripts/pretrain_sign.sh openasl outputs/slim_sign_openasl 0,1,2,3 \
+  wandb.enabled=true wandb.project=SLiM
+```
+
+Only rank 0 creates a W&B run. Losses, learning rates, teacher momentum/temperature, batch
+sizes, timing and peak memory are recorded every 10 iterations, with the same values as the
+local `training_metrics.json`. `wandb_run.json` stores the run URL and ID for resuming. To start
+from scratch, use a new output directory (or archive the old one) and pass `--no-resume`
+before any `key=value` overrides. Model checkpoints remain on local storage.
+
+**Evaluation** on WLASL-2000 (the benchmark argument is ignored, pass `-`):
+
+```bash
+python tools/export_encoder.py outputs/slim_sign_wlasl/eval/training_187499/teacher_checkpoint.pth checkpoints/sign_wlasl.pth
+scripts/eval_linear.sh checkpoints/sign_wlasl.pth outputs/lin_sign_wlasl  wlasl - 0,1,2,3
+scripts/eval_knn.sh    checkpoints/sign_wlasl.pth outputs/knn_sign_wlasl  wlasl - 0,1,2,3
+scripts/eval_semi.sh   checkpoints/sign_wlasl.pth outputs/semi_sign_wlasl wlasl - 0.1 0,1
+```
+
+**SHuBERT-style WLASL-2000 LoRA comparison** (full WLASL training split):
+
+```bash
+.venv/bin/python scripts/eval_wlasl_lora_compare.py \
+  --output-dir outputs/wlasl_lora_r1_62500_75000_87500 \
+  --gpus 0,1,2
+```
+
+This runs three experiments concurrently, one per GPU, for the teacher snapshots at
+62,500, 75,000 and 87,500 updates. Each run uses
+rank-1 LoRA on every encoder Linear, with the original encoder weights frozen. The last
+patch representations are averaged over joints and time, then classified by BN + Linear.
+The [SHuBERT ISLR protocol](https://arxiv.org/html/2411.16765v3#S4.SS3) supplies Adam,
+global batch 128, at most 125 epochs, head LR 1e-4, LoRA LR 1e-5, weight decay 1e-4 and
+label smoothing 0.1. Implementation choices not specified in the paper are alpha=1,
+no adapter dropout, constant learning rates, patience=20, and the existing SLiM sign
+augmentations with 64-frame inputs. This adapts the evaluation recipe to RTMPose69
+SLiM; it does not reproduce SHuBERT's RGB-feature encoder.
+
+All three models are selected and compared using dev P-I Top-1. The winner alone is
+then evaluated once on test, reporting per-instance/per-class Top-1/5/10. Evaluation
+never pads the split or duplicates videos, and macro accuracy averages present classes.
+Multi-GPU training wraps the complete model in DDP and uses SyncBatchNorm. The output
+contains checkpoint/data/code fingerprints, per-epoch metrics, W&B run links, and atomic
+`best.pth` / `last.pth` files with the full encoder, adapters, head, optimizer, scaler and
+per-rank RNG states. Repeating the same command resumes unfinished runs at the last
+completed epoch and skips finished runs. `results.json` and `dev_comparison.csv` hold
+final results. The original pretraining remains stopped.
+
+To use the test split directly for model selection, add `--dev-split test` and use a
+fresh output directory and W&B group. This evaluates all 2,878 test clips every epoch
+for early stopping and best-epoch selection, without evaluating the dev split. Metrics
+are logged as `test_as_dev/*`; `test_as_dev_comparison.csv` and `results.json` explicitly
+mark that no independent test score remains. There is no additional final test pass.
+
+
+Feature extraction for other uses: `slim.hub.load_encoder_from_pth(path, {"img_size": [64, 69],
+"patch_size": [4, 1]})`, input `(B, 3, T, 69, 1)` normalised with `slim.data.skeletons.normalize_sign_pose`.
+
+---
+
 ## Repository layout
 
 ```
@@ -267,15 +384,17 @@ slim/
 │   ├── augmentations.py    SAA + view sampling (DataAugmentationDINO, DownstreamAugmentation)
 │   ├── masking.py          STM (MaskingGenerator)
 │   ├── collate.py          view stacking and mask assignment
-│   └── datasets/ntu.py     NTU pre-training and classification datasets
+│   ├── skeletons.py        sign-pose joint layouts, Uni-Sign normalisation
+│   ├── sign_augmentations.py  2D sign-pose SAA
+│   └── datasets/           ntu.py (NTU), sign.py (packed sign-pose clips)
 ├── layers/             ViT blocks, temporal-RoPE attention, prototype head
 ├── loss/               MFP (iBOTPatchLoss), GLCL (DINOLoss), KoLeo
 ├── models/             SLiM encoder (vit_tiny: 8 blocks, dim 256, 8 heads)
 ├── train/              SSLMetaArch (student/teacher, EMA) and the training loop
-├── eval/               linear.py, finetune.py (semi-supervised), knn.py (retrieval)
+├── eval/               linear.py, finetune.py (semi-supervised), knn.py (retrieval), datasets.py
 └── hub.py              HuggingFace Hub loading
 scripts/                pre-training and evaluation launchers
-tools/                  checkpoint export and verification
+tools/                  checkpoint export and verification, pack_sign_poses.py
 checkpoints/            exported encoders; linear/ holds trained linear probes
 ```
 

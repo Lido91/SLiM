@@ -27,7 +27,20 @@ from slim.models.vision_transformer import BlockChunk
 try:
     from xformers.ops import fmha
 except ImportError:
-    raise AssertionError("xFormers is required for training")
+    fmha = None
+
+
+def _run_head_on_list(head, inputs_list):
+    """Run a token-wise head once over a list of (1, n_i, D) tensors and split the result back.
+
+    The heads are MLPs, so this equals the xFormers BlockDiagonalMask cat/split it replaces.
+    """
+    if fmha is not None:
+        attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_list)
+        return attn_bias.split(head(cat_inputs))
+    sizes = [x.shape[1] for x in inputs_list]
+    outputs = head(torch.cat(inputs_list, dim=1))
+    return list(outputs.split(sizes, dim=1))
 
 
 logger = logging.getLogger("slim")
@@ -283,8 +296,7 @@ class SSLMetaArch(nn.Module):
                 student_global_masked_patch_tokens_after_head = self.student.ibot_head(buffer_tensor_patch_tokens)[:n_masked_patches]
 
         # 2: run
-        _attn_bias, cat_inputs = fmha.BlockDiagonalMask.from_tensor_list(inputs_for_student_head_list)
-        outputs_list = _attn_bias.split(self.student.dino_head(cat_inputs))
+        outputs_list = _run_head_on_list(self.student.dino_head, inputs_for_student_head_list)
 
         # 3a: local crops cls tokens
         student_local_cls_tokens_after_head = outputs_list.pop(0).squeeze(0)
@@ -369,9 +381,16 @@ class SSLMetaArch(nn.Module):
     def fsdp_synchronize_streams(self):
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
-            self.student.dino_head._streams = (
-                self.teacher.dino_head._streams
-            ) = self.student.backbone._streams = self.teacher.backbone._streams
+            if hasattr(self.teacher.backbone, "_streams"):  # torch 2.0
+                self.student.dino_head._streams = (
+                    self.teacher.dino_head._streams
+                ) = self.student.backbone._streams = self.teacher.backbone._streams
+            else:  # torch >= 2.1 keeps one attribute per stream, as FSDP's own root sharing does
+                for attr in ("_unshard_stream", "_post_backward_stream", "_pre_unshard_stream",
+                             "_all_reduce_stream", "_default_stream"):
+                    stream = getattr(self.teacher.backbone, attr)
+                    for m in (self.student.dino_head, self.teacher.dino_head, self.student.backbone):
+                        setattr(m, attr, stream)
             self.need_to_synchronize_fsdp_streams = False
 
     def update_teacher(self, m):

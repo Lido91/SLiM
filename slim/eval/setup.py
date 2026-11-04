@@ -71,5 +71,6 @@ def setup_and_build_model(args) -> Tuple[Any, torch.dtype]:
     cudnn.benchmark = True
     config = setup(args)
     model = build_model_for_eval(config, args.pretrained_weights)
+    model.data_cfg = config.crops  # joint layout / clip length, read by slim.eval.datasets
     autocast_dtype = get_autocast_dtype(config)
     return model, autocast_dtype

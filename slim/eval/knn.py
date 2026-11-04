@@ -22,9 +22,7 @@ from slim.eval.setup import get_args_parser as get_setup_args_parser
 from slim.eval.setup import setup_and_build_model
 from slim.eval.utils import ModelWithIntermediateLayers
 
-# NTU Dataset Imports
-from slim.data.datasets.ntu import NTU_Classification
-from slim.data.augmentations import DownstreamAugmentation
+from slim.eval.datasets import build_classification_dataset, build_downstream_transform
 
 logger = logging.getLogger("slim")
 
@@ -47,7 +45,7 @@ def get_args_parser(
         "--data-path",
         type=str,
         default="./data/ntu",
-        help="Path to NTU dataset (.npz files)",
+        help="NTU .npz directory, or a sign-pose pack root with train/dev/test packs",
     )
     parser.add_argument(
         "--num-classes",
@@ -285,25 +283,12 @@ def eval_knn_ntu(
 ):
     # Retrieval is non-parametric: both the gallery and the queries use the
     # deterministic test-time transform, so no random augmentation enters the database.
-    train_transform = DownstreamAugmentation(out_size=64, split='test')
-    train_dataset = NTU_Classification(
-        root_path=data_path,
-        split='train',
-        num_classes=num_classes,
-        benchmark=benchmark,
-        min_buffer=150,
-        transform=train_transform
-    )
+    data_cfg = getattr(model, "data_cfg", None)
+    train_transform = build_downstream_transform('test', data_path, data_cfg)
+    train_dataset = build_classification_dataset(data_path, 'train', num_classes, benchmark, train_transform, data_cfg)
 
-    test_transform = DownstreamAugmentation(out_size=64, split='test')
-    val_dataset = NTU_Classification(
-        root_path=data_path,
-        split='test',
-        num_classes=num_classes,
-        benchmark=benchmark,
-        min_buffer=150,
-        transform=test_transform
-    )
+    test_transform = build_downstream_transform('test', data_path, data_cfg)
+    val_dataset = build_classification_dataset(data_path, 'test', num_classes, benchmark, test_transform, data_cfg)
 
     # DataLoaders
     train_loader = make_data_loader(

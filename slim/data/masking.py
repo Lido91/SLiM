@@ -33,8 +33,13 @@ class MaskingGenerator:
         num_masking_patches=None,
         min_num_patches=4,
         max_num_patches=None,
+        group_weights=None,
     ):
         self.joint_groups = joint_groups
+        # None = pick a group uniformly (original). With groups of very different sizes (sign:
+        # 3-joint arms vs 21-joint hands) uniform picks under-mask the big groups per joint;
+        # train.py passes sqrt(group size) weights, which equalise per-joint mask rates.
+        self.group_weights = group_weights
 
         if not isinstance(input_size, tuple):
             input_size = (input_size,) * 2
@@ -63,7 +68,10 @@ class MaskingGenerator:
         delta = 0
         for _ in range(10):
             # 1. Pick one anatomical group, then a contiguous subset of its joints.
-            group_idx = random.randint(0, len(self.joint_groups) - 1)
+            if self.group_weights is None:
+                group_idx = random.randint(0, len(self.joint_groups) - 1)
+            else:
+                group_idx = random.choices(range(len(self.joint_groups)), weights=self.group_weights)[0]
             full_group_joints = self.joint_groups[group_idx]
             group_len = len(full_group_joints)
             if group_len > 1:

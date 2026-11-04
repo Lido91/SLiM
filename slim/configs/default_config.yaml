@@ -1,5 +1,12 @@
 MODEL:
   WEIGHTS: ''
+wandb:
+  enabled: false
+  project: SLiM
+  entity: null
+  name: null
+  id: null
+  mode: online
 compute_precision:
   grad_scaler: true
   teacher:
@@ -112,6 +119,9 @@ optim:
 crops:
   num_joints: 25
   num_people: 2
+  skeleton: null                    # null = NTU (Kinect-25, 3D); sign69 / sign51 = RTMPose sign pose
+  pose_norm: part                   # sign only: part (Uni-Sign, part-local) or global (body bbox)
+  max_window_frames: 0              # sign only: global views come from one window of <= N frames (0 = whole clip)
   local_crops_number: 8
   global_crops_size:                # (T, V) -> token grid 8 x 25
   - 64

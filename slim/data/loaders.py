@@ -10,7 +10,7 @@ from typing import Any, Callable, List, Optional, TypeVar
 import torch
 from torch.utils.data import Sampler
 
-from .datasets import NTU
+from .datasets import NTU, SignPose
 from .samplers import EpochSampler, InfiniteSampler, ShardedInfiniteSampler
 
 
@@ -40,6 +40,10 @@ def _parse_dataset_str(dataset_str: str):
         class_ = NTU
         if "split" in kwargs:
             kwargs["split"] = NTU.Split[kwargs["split"]]
+    elif name == "SignPose":  # root = one or more pack dirs joined by ','
+        class_ = SignPose
+        if "split" in kwargs:
+            kwargs["split"] = SignPose.Split[kwargs["split"]]
     else:
         raise ValueError(f'Unsupported dataset "{name}"')
 
@@ -51,15 +55,18 @@ def make_dataset(
     dataset_str: str,
     transform: Optional[Callable] = None,
     target_transform: Optional[Callable] = None,
+    **dataset_kwargs,
 ):
     """
     Creates a dataset with the specified parameters.
 
     Args:
         dataset_str: A dataset string description
-            (e.g. NTU:root=/path/to/NTU60_XSub.npz:split=TRAIN).
+            (e.g. NTU:root=/path/to/NTU60_XSub.npz:split=TRAIN,
+             SignPose:root=data/sign/CSL_Daily/train,data/sign/How2Sign/train).
         transform: A transform to apply to skeleton clips.
         target_transform: A transform to apply to targets.
+        dataset_kwargs: extra constructor arguments (e.g. skeleton / norm for SignPose).
 
     Returns:
         The created dataset.
@@ -67,7 +74,7 @@ def make_dataset(
     logger.info(f'using dataset: "{dataset_str}"')
 
     class_, kwargs = _parse_dataset_str(dataset_str)
-    dataset = class_(transform=transform, target_transform=target_transform, **kwargs)
+    dataset = class_(transform=transform, target_transform=target_transform, **kwargs, **dataset_kwargs)
 
     logger.info(f"# of dataset samples: {len(dataset):,d}")
 

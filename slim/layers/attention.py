@@ -165,14 +165,14 @@ class MemEffAttention_RoPE(Attention):
         x: (B, N, C) where N = 1(CLS) + num_registers + (num_t * num_v)
         num_t: Temporal frames input
         """
-        if not XFORMERS_AVAILABLE:
-            raise AssertionError("xFormers is required for MemEffAttention_RoPE implementation.")
+        if not XFORMERS_AVAILABLE and attn_bias is not None:
+            raise AssertionError("xFormers is required for using nested tensors")
 
         B, N, C = x.shape
 
         # 1. QKV Calculation (using base class layer)
         qkv = self.qkv(x).reshape(B, N, 3, self.num_heads, C // self.num_heads)
-        q, k, v = unbind(qkv, 2)  # (B, N, H, D)
+        q, k, v = torch.unbind(qkv, 2)  # (B, N, H, D)
 
         # ---------------------------------------------------------
         # RoPE Logic: Global(Center) vs Data(Temporal)
@@ -200,8 +200,12 @@ class MemEffAttention_RoPE(Attention):
 
         # ---------------------------------------------------------
 
-        # 2. xFormers Attention
-        x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        # 2. Attention: xFormers if available, otherwise PyTorch SDPA (same math, (B, H, N, D) layout)
+        if XFORMERS_AVAILABLE:
+            x = memory_efficient_attention(q, k, v, attn_bias=attn_bias)
+        else:
+            q, k, v = [t.transpose(1, 2) for t in (q, k, v)]
+            x = nn.functional.scaled_dot_product_attention(q, k, v).transpose(1, 2)
 
         # 3. Output Projection
         x = x.reshape([B, N, C])

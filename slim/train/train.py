@@ -14,9 +14,11 @@ import torch
 
 from slim.data import SamplerType, make_data_loader, make_dataset
 from slim.data import collate_data_and_cast, DataAugmentationDINO, MaskingGenerator
+from slim.data.skeletons import get_skeleton, is_sign_skeleton
 import slim.distributed as distributed
 from slim.fsdp import FSDPCheckpointer
 from slim.logging import MetricLogger
+from slim.logging.wandb import track_training
 from slim.utils.config import setup
 from slim.utils.utils import CosineScheduler
 
@@ -132,7 +134,7 @@ def do_test(cfg, model, iteration):
         torch.save({"teacher": new_state_dict}, teacher_ckp_path)
 
 
-def do_train(cfg, model, resume=False):
+def do_train(cfg, model, resume=False, metric_sink=None):
     model.train()
     inputs_dtype = torch.half
     fp16_scaler = model.fp16_scaler  # for mixed precision training
@@ -168,10 +170,24 @@ def do_train(cfg, model, resume=False):
     img_size = cfg.crops.global_crops_size  # T, V
     patch_size = cfg.student.patch_size
     n_tokens = img_size[0] // patch_size[0] * img_size[1] // patch_size[1]
+
+    # Sign pose: joint layout drives STM groups, augmentations and the dataset; NTU keeps defaults.
+    skeleton, mask_kwargs, dataset_kwargs = None, {}, {}
+    if is_sign_skeleton(cfg.crops.skeleton):
+        skeleton = get_skeleton(cfg.crops.skeleton, norm=cfg.crops.pose_norm)
+        assert img_size[1] == skeleton.num_joints and patch_size[1] == 1, (
+            f"crops.global_crops_size[1] must be {skeleton.num_joints} joints with P_J = 1 for {skeleton.name}"
+        )
+        # sqrt(group size) weights give hands, arms and face ~equal per-joint mask rates
+        mask_kwargs = dict(joint_groups=skeleton.mask_groups,
+                           group_weights=[len(g) ** 0.5 for g in skeleton.mask_groups])
+        dataset_kwargs = dict(skeleton=cfg.crops.skeleton, norm=cfg.crops.pose_norm)
+
     mask_generator = MaskingGenerator(
         input_size=(img_size[0] // patch_size[0], img_size[1] // patch_size[1]),
         min_num_patches=8,
         max_num_patches=0.5 * n_tokens,
+        **mask_kwargs,
     )
 
     local_mask_generator = {
@@ -179,16 +195,19 @@ def do_train(cfg, model, resume=False):
             input_size=(img_size[0] // 2 // patch_size[0], img_size[1] // patch_size[1]),
             min_num_patches=4,
             max_num_patches=0.5 * n_tokens,
+            **mask_kwargs,
         ),
         'local_crops_16': MaskingGenerator(
             input_size=(img_size[0] // 4 // patch_size[0], img_size[1] // patch_size[1]),
             min_num_patches=2,
             max_num_patches=0.5 * n_tokens,
+            **mask_kwargs,
         ),
         'local_crops_8': MaskingGenerator(
             input_size=(img_size[0] // 8 // patch_size[0], img_size[1] // patch_size[1]),
             min_num_patches=1,
             max_num_patches=0.5 * n_tokens,
+            **mask_kwargs,
         )
     }
 
@@ -197,6 +216,8 @@ def do_train(cfg, model, resume=False):
         global_crops_size=cfg.crops.global_crops_size[0],
         local_crops_size=cfg.crops.local_crops_size[0],
         split='train',
+        skeleton=skeleton,
+        max_window=cfg.crops.max_window_frames,
     )
 
     collate_fn = partial(
@@ -218,6 +239,7 @@ def do_train(cfg, model, resume=False):
         dataset_str=cfg.train.dataset_path,
         transform=data_transform,
         target_transform=lambda _: (),
+        **dataset_kwargs,
     )
     sampler_type = SamplerType.SHARDED_INFINITE
     data_loader = make_data_loader(
@@ -238,7 +260,7 @@ def do_train(cfg, model, resume=False):
 
     logger.info("Starting training from iteration {}".format(start_iter))
     metrics_file = os.path.join(cfg.train.output_dir, "training_metrics.json")
-    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file)
+    metric_logger = MetricLogger(delimiter="  ", output_file=metrics_file, metric_sink=metric_sink)
     header = "Training"
 
     for data in metric_logger.log_every(
@@ -300,8 +322,11 @@ def do_train(cfg, model, resume=False):
         metric_logger.update(lr=lr)
         metric_logger.update(wd=wd)
         metric_logger.update(mom=mom)
+        metric_logger.update(teacher_temp=teacher_temp)
         metric_logger.update(last_layer_lr=last_layer_lr)
         metric_logger.update(current_batch_size=current_batch_size)
+        metric_logger.update(global_batch_size=current_batch_size * distributed.get_global_size())
+        metric_logger.update(epoch=(iteration + 1) / OFFICIAL_EPOCH_LENGTH)
         metric_logger.update(total_loss=losses_reduced, **loss_dict_reduced)
 
         # checkpointing and testing
@@ -319,20 +344,21 @@ def do_train(cfg, model, resume=False):
 def main(args):
     cfg = setup(args)
 
-    model = SSLMetaArch(cfg).to(torch.device("cuda"))
-    model.prepare_for_distributed_training()
+    with track_training(cfg, enabled=not args.eval_only) as metric_sink:
+        model = SSLMetaArch(cfg).to(torch.device("cuda"))
+        model.prepare_for_distributed_training()
 
-    logger.info("Model:\n{}".format(model))
-    if args.eval_only:
-        iteration = (
-            FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
-            .resume_or_load(cfg.MODEL.WEIGHTS, resume=not args.no_resume)
-            .get("iteration", -1)
-            + 1
-        )
-        return do_test(cfg, model, f"manual_{iteration}")
+        logger.info("Model:\n{}".format(model))
+        if args.eval_only:
+            iteration = (
+                FSDPCheckpointer(model, save_dir=cfg.train.output_dir)
+                .resume_or_load(cfg.MODEL.WEIGHTS, resume=not args.no_resume)
+                .get("iteration", -1)
+                + 1
+            )
+            return do_test(cfg, model, f"manual_{iteration}")
 
-    do_train(cfg, model, resume=not args.no_resume)
+        do_train(cfg, model, resume=not args.no_resume, metric_sink=metric_sink)
 
 
 if __name__ == "__main__":

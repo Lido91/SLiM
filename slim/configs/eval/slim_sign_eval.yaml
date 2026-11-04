@@ -1,0 +1,31 @@
+# Encoder + data definition for the downstream protocols on sign-pose packs (linear / semi / k-NN).
+# Must match the pre-training config of the checkpoint (patch size, skeleton, pose_norm).
+student:
+  arch: vit_tiny
+  patch_size:
+  - 4
+  - 1
+  drop_path_rate: 0.0
+  layerscale: 0.0
+  drop_path_uniform: true
+  pretrained_weights: ''
+  ffn_layer: swiglufused
+  block_chunks: 0
+  qkv_bias: true
+  proj_bias: true
+  ffn_bias: true
+  num_register_tokens: 4
+  in_chans: 3
+
+crops:
+  skeleton: sign69
+  pose_norm: part
+  num_joints: 69
+  num_people: 1
+  local_crops_number: 8
+  global_crops_size:
+  - 64
+  - 69
+  local_crops_size:
+  - 16
+  - 69

@@ -18,10 +18,11 @@ logger = logging.getLogger("slim")
 
 
 class MetricLogger(object):
-    def __init__(self, delimiter="\t", output_file=None):
+    def __init__(self, delimiter="\t", output_file=None, metric_sink=None):
         self.meters = defaultdict(SmoothedValue)
         self.delimiter = delimiter
         self.output_file = output_file
+        self.metric_sink = metric_sink
 
     def update(self, **kwargs):
         for k, v in kwargs.items():
@@ -51,7 +52,7 @@ class MetricLogger(object):
         self.meters[name] = meter
 
     def dump_in_output_file(self, iteration, iter_time, data_time):
-        if self.output_file is None or not distributed.is_main_process():
+        if not distributed.is_main_process() or (self.output_file is None and self.metric_sink is None):
             return
         dict_to_dump = dict(
             iteration=iteration,
@@ -59,9 +60,13 @@ class MetricLogger(object):
             data_time=data_time,
         )
         dict_to_dump.update({k: v.median for k, v in self.meters.items()})
-        with open(self.output_file, "a") as f:
-            f.write(json.dumps(dict_to_dump) + "\n")
-        pass
+        if torch.cuda.is_available():
+            dict_to_dump["max_memory_mb"] = torch.cuda.max_memory_allocated() / (1024.0 * 1024.0)
+        if self.output_file is not None:
+            with open(self.output_file, "a") as f:
+                f.write(json.dumps(dict_to_dump) + "\n")
+        if self.metric_sink is not None:
+            self.metric_sink(dict_to_dump)
 
     def log_every(self, iterable, print_freq, header=None, n_iterations=None, start_iteration=0):
         i = start_iteration

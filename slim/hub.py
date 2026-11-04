@@ -94,12 +94,16 @@ class SLiMEncoder(DinoVisionTransformer):
         save_file(state, os.path.join(save_directory, WEIGHTS_NAME))
 
 
-def load_encoder_from_pth(path):
-    """Build the encoder from a `.pth` checkpoint in the `tools/export_encoder.py` format."""
+def load_encoder_from_pth(path, config=None):
+    """Build the encoder from a `.pth` checkpoint in the `tools/export_encoder.py` format.
+
+    `config` overrides DEFAULT_CONFIG (NTU); a sign-pose encoder from the slim_sign_* configs needs
+    {"img_size": [64, 69], "patch_size": [4, 1]}.
+    """
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["teacher"] if "teacher" in ckpt else ckpt
     state = {k.replace("backbone.", ""): v for k, v in state.items() if k.startswith("backbone.")}
-    model = SLiMEncoder.from_config({})
+    model = SLiMEncoder.from_config(config or {})
     missing, _ = model.load_state_dict(state, strict=False)
     if missing:
         raise RuntimeError(f"{path} is missing encoder weights: {missing[:5]}")

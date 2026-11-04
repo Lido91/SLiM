@@ -11,6 +11,8 @@ import numpy as np
 import torch
 import torch.nn.functional as F
 
+from .sign_augmentations import sign_flip, sign_bone_scale, sign_rotate, sign_noise, sign_part_drop
+
 
 logger = logging.getLogger("slim")
 
@@ -145,9 +147,17 @@ class DataAugmentationDINO(object):
             global_crops_size=64,
             local_crops_size=16,
             split='train',
+            skeleton=None,
+            max_window=0,
     ):
         self.global_crops_size = global_crops_size
         self.split = split
+        # skeleton=None keeps the original NTU (3D Kinect) augmentations; a SkeletonSpec
+        # switches to the 2D sign-pose ones.
+        self.skeleton = skeleton
+        # Long sequences (sentences): both global views are drawn from one random window of at
+        # most `max_window` frames, so they overlap and are not over-compressed in time.
+        self.max_window = max_window
 
         self.global_p_interval = [0.5, 1.0]
 
@@ -214,24 +224,37 @@ class DataAugmentationDINO(object):
         return data, range_info
 
     def _apply_geometric(self, crop):
+        if self.split == 'train' and self.skeleton is not None:
+            crop = sign_flip(crop, self.skeleton, p=0.5)
+            crop = sign_bone_scale(crop, self.skeleton, scale_range=(0.85, 1.15), p=0.5)
+            crop = sign_rotate(crop, theta=0.2, p=0.5)
+            return crop
         if self.split == 'train':
             crop = spatial_flip(crop, p=0.5)
             crop = random_scale(crop, scale_range=(0.85, 1.15), p=0.5)
             crop = random_rot(crop, theta_tilt=0.3, theta_vertical=0.3, p=0.5)  # math.pi
         return crop
 
+    # Sign coordinates are bbox-normalised (finger bones are ~0.05 units), hence smaller noise.
     def _apply_global_1_extra(self, crop):
+        if self.split == 'train' and self.skeleton is not None:
+            return sign_noise(crop, std=0.005, p=1.0)
         if self.split == 'train':
             crop = gaussian_noise(crop, std=0.01, p=1.0)
         return crop
 
     def _apply_global_2_extra(self, crop):
+        if self.split == 'train' and self.skeleton is not None:
+            crop = sign_noise(crop, std=0.02, p=0.1)
+            return sign_part_drop(crop, self.skeleton, p=0.2)
         if self.split == 'train':
             crop = gaussian_noise(crop, std=0.05, p=0.1)
             crop = axis_drop(crop, p=0.2)
         return crop
 
     def _apply_local_extra(self, crop):
+        if self.split == 'train' and self.skeleton is not None:
+            return sign_noise(crop, std=0.005, p=0.5)
         if self.split == 'train':
             crop = gaussian_noise(crop, std=0.01, p=0.5)
         return crop
@@ -242,13 +265,21 @@ class DataAugmentationDINO(object):
         global_crops = []
         global_ranges = []
 
+        window = None
+        valid_len = valid_frame_num if valid_frame_num else buffer_seq.shape[1]
+        if self.max_window and valid_len > self.max_window:
+            start = np.random.randint(0, valid_len - self.max_window + 1)
+            window = (start, start + self.max_window)
+
         # Crop 1
-        c1, r1 = self._interpolated_crop(buffer_seq, self.global_crops_size, self.global_p_interval, valid_frame_num)
+        c1, r1 = self._interpolated_crop(buffer_seq, self.global_crops_size, self.global_p_interval, valid_frame_num,
+                                         constraint_indices=window)
         global_crops.append(torch.from_numpy(self._apply_global_1_extra(self._apply_geometric(c1))).float())
         global_ranges.append(r1)
 
         # Crop 2
-        c2, r2 = self._interpolated_crop(buffer_seq, self.global_crops_size, self.global_p_interval, valid_frame_num)
+        c2, r2 = self._interpolated_crop(buffer_seq, self.global_crops_size, self.global_p_interval, valid_frame_num,
+                                         constraint_indices=window)
         global_crops.append(torch.from_numpy(self._apply_global_2_extra(self._apply_geometric(c2))).float())
         global_ranges.append(r2)
 
@@ -286,9 +317,11 @@ class DownstreamAugmentation(object):
             self,
             out_size=64,  #TODO: back to 64,
             split='train',
+            skeleton=None,
     ):
         self.out_size = out_size
         self.split = split
+        self.skeleton = skeleton  # None = NTU augmentations, SkeletonSpec = sign-pose ones
         logger.info(f"Initialized DownstreamAugmentation (Split: {split}, Size: {out_size})")
 
     def _train_sampling(self, seq, valid_frame_num=None):
@@ -325,7 +358,9 @@ class DownstreamAugmentation(object):
                 bst = bids[:window]
                 inds = bst
 
-            inds = inds + bias
+            # The centring bias can overshoot the clip by one frame (40-64 valid frames). NTU's
+            # ping-pong padding makes that frame equal to the last valid one; clamp to the same.
+            inds = np.minimum(inds + bias, valid_size - 1)
             data = data_numpy[:, inds, :, :]
 
         else:
@@ -379,7 +414,12 @@ class DownstreamAugmentation(object):
         else:
             crop = self._test_sampling(buffer_seq, valid_frame_num)
 
-        if self.split == 'train':
+        if self.split == 'train' and self.skeleton is not None:
+            crop = sign_flip(crop, self.skeleton, p=0.5)
+            crop = sign_bone_scale(crop, self.skeleton, scale_range=(0.85, 1.15), p=0.5)
+            crop = sign_rotate(crop, theta=0.2, p=0.5)
+            crop = sign_noise(crop, std=0.005, p=0.5)
+        elif self.split == 'train':
             crop = spatial_flip(crop, p=0.5)
             crop = random_scale(crop, scale_range=(0.85, 1.15), p=0.5)
             crop = random_rot(crop, theta_tilt=0.3, theta_vertical=math.pi, p=0.5)

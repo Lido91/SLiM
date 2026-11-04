@@ -25,8 +25,7 @@ from slim.eval.setup import setup_and_build_model
 from slim.eval.utils import evaluate
 from slim.logging import MetricLogger
 
-from slim.data.datasets.ntu import NTU_Classification
-from slim.data.augmentations import DownstreamAugmentation
+from slim.eval.datasets import build_classification_dataset, build_downstream_transform, split_from_dataset_str
 
 logger = logging.getLogger("slim")
 
@@ -44,7 +43,7 @@ def get_args_parser(
         parents=parents,
         add_help=add_help,
     )
-    parser.add_argument("--data-path", type=str, default="./data/ntu", help="Path to NTU dataset (.npz files)")
+    parser.add_argument("--data-path", type=str, default="./data/ntu", help="NTU .npz directory, or a sign-pose pack root with train/dev/test packs")
     parser.add_argument("--num-classes", type=int, default=60, help="Number of classes in NTU dataset")
     parser.add_argument("--benchmark", type=str, default="xsub", choices=["xsub", "xview"],
                         help="NTU Benchmark (xsub or xview)")
@@ -391,15 +390,11 @@ def eval_linear(
     return val_results_dict, feature_model, linear_classifiers, iteration
 
 
-def make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type, data_path, num_classes, benchmark):
-    test_transform = DownstreamAugmentation(out_size=64, split='test')
-    test_dataset = NTU_Classification(
-        root_path=data_path,
-        split='test',
-        num_classes=num_classes,
-        benchmark=benchmark,
-        min_buffer=150,
-        transform=test_transform
+def make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type, data_path, num_classes, benchmark,
+                          data_cfg=None):
+    test_transform = build_downstream_transform('test', data_path, data_cfg)
+    test_dataset = build_classification_dataset(
+        data_path, split_from_dataset_str(test_dataset_str), num_classes, benchmark, test_transform, data_cfg
     )
 
     test_data_loader = make_data_loader(
@@ -431,12 +426,13 @@ def test_on_datasets(
         benchmark,
         prefixstring="",
         test_class_mappings=[None],
+        data_cfg=None,
 ):
     results_dict = {}
     for test_dataset_str, class_mapping, metric_type in zip(test_dataset_strs, test_class_mappings, test_metric_types):
         logger.info(f"Testing on {test_dataset_str}")
         test_data_loader = make_eval_data_loader(test_dataset_str, batch_size, num_workers, metric_type, data_path,
-                                                 num_classes, benchmark)
+                                                 num_classes, benchmark, data_cfg)
         dataset_results_dict = evaluate_linear_classifiers(
             feature_model,
             remove_ddp_wrapper(linear_classifiers),
@@ -489,16 +485,10 @@ def run_eval_linear(
         assert len(test_metric_types) == len(test_dataset_strs)
     assert len(test_dataset_strs) == len(test_class_mapping_fpaths)
 
-    train_transform = DownstreamAugmentation(out_size=64, split='train')
-    train_dataset = NTU_Classification(
-        root_path=data_path,
-        split='train',
-        num_classes=num_classes,
-        benchmark=benchmark,
-        min_buffer=150,
-        transform=train_transform,
-        sample_ratio=sample_ratio,
-    )
+    data_cfg = getattr(model, "data_cfg", None)
+    train_transform = build_downstream_transform('train', data_path, data_cfg)
+    train_dataset = build_classification_dataset(data_path, 'train', num_classes, benchmark, train_transform, data_cfg,
+                                                 sample_ratio=sample_ratio)
 
     training_num_classes = len(torch.unique(torch.Tensor(train_dataset.get_targets().astype(int))))
     sampler_type = SamplerType.SHARDED_INFINITE
@@ -545,7 +535,7 @@ def run_eval_linear(
         collate_fn=None,
     )
     val_data_loader = make_eval_data_loader(val_dataset_str, batch_size, num_workers, val_metric_type, data_path,
-                                            num_classes, benchmark)
+                                            num_classes, benchmark, data_cfg)
 
     checkpoint_period = save_checkpoint_frequency * epoch_length
 
@@ -603,6 +593,7 @@ def run_eval_linear(
             benchmark,
             prefixstring="",
             test_class_mappings=test_class_mappings,
+            data_cfg=data_cfg,
         )
     results_dict["best_classifier"] = val_results_dict["best_classifier"]["name"]
     results_dict[f"{val_dataset_str}_accuracy"] = 100.0 * val_results_dict["best_classifier"]["accuracy"]
