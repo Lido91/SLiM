@@ -149,6 +149,9 @@ class DataAugmentationDINO(object):
             split='train',
             skeleton=None,
             max_window=0,
+            parent_matching=False,
+            min_global_overlap=0.0,
+            noise_std=0.005,
     ):
         self.global_crops_size = global_crops_size
         self.split = split
@@ -158,6 +161,9 @@ class DataAugmentationDINO(object):
         # Long sequences (sentences): both global views are drawn from one random window of at
         # most `max_window` frames, so they overlap and are not over-compressed in time.
         self.max_window = max_window
+        self.parent_matching = parent_matching
+        self.min_global_overlap = min_global_overlap
+        self.noise_std = noise_std
 
         self.global_p_interval = [0.5, 1.0]
 
@@ -238,14 +244,14 @@ class DataAugmentationDINO(object):
     # Sign coordinates are bbox-normalised (finger bones are ~0.05 units), hence smaller noise.
     def _apply_global_1_extra(self, crop):
         if self.split == 'train' and self.skeleton is not None:
-            return sign_noise(crop, std=0.005, p=1.0)
+            return sign_noise(crop, std=self.noise_std, p=1.0)
         if self.split == 'train':
             crop = gaussian_noise(crop, std=0.01, p=1.0)
         return crop
 
     def _apply_global_2_extra(self, crop):
         if self.split == 'train' and self.skeleton is not None:
-            crop = sign_noise(crop, std=0.02, p=0.1)
+            crop = sign_noise(crop, std=self.noise_std * 2 if self.parent_matching else 0.02, p=0.1)
             return sign_part_drop(crop, self.skeleton, p=0.2)
         if self.split == 'train':
             crop = gaussian_noise(crop, std=0.05, p=0.1)
@@ -254,7 +260,7 @@ class DataAugmentationDINO(object):
 
     def _apply_local_extra(self, crop):
         if self.split == 'train' and self.skeleton is not None:
-            return sign_noise(crop, std=0.005, p=0.5)
+            return sign_noise(crop, std=self.noise_std, p=0.5)
         if self.split == 'train':
             crop = gaussian_noise(crop, std=0.01, p=0.5)
         return crop
@@ -280,6 +286,16 @@ class DataAugmentationDINO(object):
         # Crop 2
         c2, r2 = self._interpolated_crop(buffer_seq, self.global_crops_size, self.global_p_interval, valid_frame_num,
                                          constraint_indices=window)
+        if self.min_global_overlap:
+            def overlap(a, b):
+                return max(0, min(a[1], b[1]) - max(a[0], b[0])) / max(1, min(a[1]-a[0], b[1]-b[0]))
+            for _ in range(16):
+                if overlap(r1, r2) >= self.min_global_overlap:
+                    break
+                c2, r2 = self._interpolated_crop(buffer_seq, self.global_crops_size, self.global_p_interval,
+                                                valid_frame_num, constraint_indices=window)
+            if overlap(r1, r2) < self.min_global_overlap:
+                c2, r2 = c1.copy(), r1
         global_crops.append(torch.from_numpy(self._apply_global_2_extra(self._apply_geometric(c2))).float())
         global_ranges.append(r2)
 
@@ -293,6 +309,8 @@ class DataAugmentationDINO(object):
 
             key_name = f"local_crops_{size}"  # e.g., local_crops_32
             output[key_name] = []
+            if self.parent_matching:
+                output[key_name.replace("crops", "parents")] = []
 
             for g_idx in range(2):
                 ref_range = global_ranges[g_idx]
@@ -308,6 +326,8 @@ class DataAugmentationDINO(object):
                     crop_geo = self._apply_geometric(crop_base.copy())
                     crop_final = self._apply_local_extra(crop_geo)
                     output[key_name].append(torch.from_numpy(crop_final).float())
+                    if self.parent_matching:
+                        output[key_name.replace("crops", "parents")].append(g_idx)
 
         return output
 

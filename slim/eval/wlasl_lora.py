@@ -68,7 +68,10 @@ class SignLoRAClassifier(nn.Module):
         self.head = nn.Sequential(nn.BatchNorm1d(encoder.embed_dim), nn.Linear(encoder.embed_dim, classes))
 
     def forward(self, clips):
-        patches = self.encoder.forward_features(clips)["x_norm_patchtokens"]
+        features = self.encoder.forward_features(clips)
+        if "x_norm_embedding" in features:
+            return self.head(features["x_norm_embedding"])
+        patches = features["x_norm_patchtokens"]
         # SLiM has joint tokens at each temporal patch. Average joints first, then
         # time, to obtain the temporal-average representation used by the head.
         temporal = patches.reshape(patches.shape[0], clips.shape[2] // 4, 69, -1).mean(dim=2)
@@ -306,6 +309,7 @@ def main():
     # Identical initialization and sampler seeds for all three pretrained snapshots.
     seed_all(args.seed)
     encoder = load_encoder_from_pth(args.checkpoint, ENCODER_CONFIG)
+    encoder_config = encoder.get_config() if hasattr(encoder, "get_config") else ENCODER_CONFIG
     model = SignLoRAClassifier(encoder, rank=args.rank, alpha=args.alpha)
     before_digest = frozen_digest(model)
     if world_size > 1:
@@ -322,7 +326,7 @@ def main():
               if key not in {"mode", "resume", "output_dir", "smoke_steps"}}
     config.update({"checkpoint": str(Path(args.checkpoint).resolve()),
                    "checkpoint_sha256": sha256(args.checkpoint), "data_path": str(Path(args.data_path).resolve()),
-                   "data": check_data(args.data_path), "world_size": world_size, "encoder": ENCODER_CONFIG,
+                   "data": check_data(args.data_path), "world_size": world_size, "encoder": encoder_config,
                    "lora_layers": model.lora_layers, "lora_parameters": sum(p.numel() for p in encoder_trainable),
                    "head_parameters": sum(p.numel() for p in head_trainable), "frozen_sha256": before_digest,
                    "paper": PAPER, "selection": f"max {score_prefix} pi_top1, earliest epoch on ties",
@@ -330,7 +334,8 @@ def main():
                    "scheduler": "constant (paper does not specify a downstream schedule)",
                    "patience_note": "20 non-improving epochs is an implementation choice; paper gives no patience",
                    "sampling": "SLiM sign69 part normalization; existing train augmentations; 64 frames; deterministic dev/test",
-                   "pooling": "last contextual patch layer, mean joints then time; BN1d(256) + Linear(256,2000)",
+                   "pooling": ("validity-aware part-balanced joint detail plus CLS; BN + Linear" if encoder_config.get("arch") == "slim_v2"
+                               else "last contextual patch layer, mean joints then time; BN1d(256) + Linear(256,2000)"),
                    "precision": "float32" if args.fp32 else "float16 autocast + GradScaler",
                    "sync_bn": world_size > 1, "drop_last_train": True, "eval_padding": False,
                    "code_sha256": sha256(__file__), "torch": torch.__version__})

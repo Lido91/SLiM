@@ -131,7 +131,11 @@ def do_test(cfg, model, iteration):
         os.makedirs(eval_dir, exist_ok=True)
         # save teacher checkpoint
         teacher_ckp_path = os.path.join(eval_dir, "teacher_checkpoint.pth")
-        torch.save({"teacher": new_state_dict}, teacher_ckp_path)
+        backbone = model.teacher["backbone"]
+        payload = {"teacher": new_state_dict}
+        if hasattr(backbone, "get_config"):
+            payload["encoder_config"] = backbone.get_config()
+        torch.save(payload, teacher_ckp_path)
 
 
 def do_train(cfg, model, resume=False, metric_sink=None):
@@ -151,12 +155,31 @@ def do_train(cfg, model, resume=False, metric_sink=None):
     ) = build_schedulers(cfg)
 
     # checkpointer
-    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, optimizer=optimizer, save_to_disk=True)
+    checkpointables = {"optimizer": optimizer}
+    if cfg.student.arch == "slim_v2":
+        from .v2_state import V2TrainState
+        checkpointables["v2_state"] = V2TrainState(cfg)
+        if fp16_scaler is not None:
+            checkpointables["scaler"] = fp16_scaler
+    checkpointer = FSDPCheckpointer(model, cfg.train.output_dir, save_to_disk=True, **checkpointables)
 
+    if cfg.student.arch == "slim_v2" and (checkpointer.has_checkpoint() or cfg.MODEL.WEIGHTS):
+        checkpoint_path = checkpointer.get_checkpoint_file() if resume and checkpointer.has_checkpoint() else cfg.MODEL.WEIGHTS
+        if checkpoint_path:
+            checkpoint = torch.load(checkpoint_path, map_location="cpu")
+            if "v2_state" not in checkpoint:
+                raise ValueError("V2 training requires a V2 checkpoint; V1 weights cannot resume this architecture")
+            checkpointables["v2_state"].load_state_dict(checkpoint["v2_state"])
+            del checkpoint
     start_iter = checkpointer.resume_or_load(cfg.MODEL.WEIGHTS, resume=resume).get("iteration", -1) + 1
 
     OFFICIAL_EPOCH_LENGTH = cfg.train.OFFICIAL_EPOCH_LENGTH
     max_iter = cfg.optim.epochs * OFFICIAL_EPOCH_LENGTH
+    if cfg.train.get("max_steps", 0):
+        max_iter = min(max_iter, int(cfg.train.max_steps))
+    if start_iter >= max_iter:
+        logger.info("Requested training budget already complete at iteration %s", start_iter)
+        return {}
 
     periodic_checkpointer = PeriodicCheckpointer(
         checkpointer,
@@ -218,6 +241,9 @@ def do_train(cfg, model, resume=False, metric_sink=None):
         split='train',
         skeleton=skeleton,
         max_window=cfg.crops.max_window_frames,
+        parent_matching=cfg.student.arch == "slim_v2",
+        min_global_overlap=cfg.crops.get("min_global_overlap", 0.0),
+        noise_std=cfg.crops.get("noise_std", 0.005),
     )
 
     collate_fn = partial(
@@ -230,6 +256,9 @@ def do_train(cfg, model, resume=False, metric_sink=None):
         n_people=n_people,
         mask_generator=mask_generator,
         local_mask_generator=local_mask_generator,
+        respect_validity=cfg.student.arch == "slim_v2",
+        patch_size=patch_size[0],
+        max_mfp_tokens_per_view=cfg.ibot.get("max_mfp_tokens_per_view", 0),
         dtype=inputs_dtype,
     )
 
@@ -247,9 +276,9 @@ def do_train(cfg, model, resume=False, metric_sink=None):
         batch_size=cfg.train.batch_size_per_gpu,
         num_workers=cfg.train.num_workers,
         shuffle=True,
-        seed=start_iter,  # data order is keyed to the resume point, not replayed
+        seed=(torch.initial_seed() - distributed.get_global_rank()) if cfg.student.arch == "slim_v2" else start_iter,
         sampler_type=sampler_type,
-        sampler_advance=0,
+        sampler_advance=start_iter * cfg.train.batch_size_per_gpu if cfg.student.arch == "slim_v2" else 0,
         drop_last=True,
         collate_fn=collate_fn,
     )

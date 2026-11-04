@@ -132,6 +132,8 @@ class SSLMetaArch(nn.Module):
 
         self.student = nn.ModuleDict(student_model_dict)
         self.teacher = nn.ModuleDict(teacher_model_dict)
+        if cfg.student.arch == "slim_v2":
+            self.teacher.load_state_dict(self.student.state_dict())
 
         # there is no backpropagation through the teacher, so no need for gradients
         for p in self.teacher.parameters():
@@ -148,6 +150,9 @@ class SSLMetaArch(nn.Module):
             loss.backward()
 
     def forward_backward(self, images, teacher_temp):
+        if self.cfg.student.arch == "slim_v2":
+            from .v2_objective import forward_backward
+            return forward_backward(self, images, teacher_temp)
         n_global_crops = 2
         assert n_global_crops == 2
 
@@ -379,6 +384,8 @@ class SSLMetaArch(nn.Module):
         return loss_dict
 
     def fsdp_synchronize_streams(self):
+        if not get_fsdp_modules(self.student.backbone):
+            return
         if self.need_to_synchronize_fsdp_streams:
             torch.cuda.synchronize()
             if hasattr(self.teacher.backbone, "_streams"):  # torch 2.0
@@ -398,6 +405,9 @@ class SSLMetaArch(nn.Module):
         teacher_param_list = []
         with torch.no_grad():
             for k in self.student.keys():
+                if not get_fsdp_modules(self.student[k]):
+                    student_param_list += list(self.student[k].parameters())
+                    teacher_param_list += list(self.teacher[k].parameters())
                 for ms, mt in zip(get_fsdp_modules(self.student[k]), get_fsdp_modules(self.teacher[k])):
                     student_param_list += ms.params
                     teacher_param_list += mt.params

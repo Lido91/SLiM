@@ -18,6 +18,9 @@ def collate_data_and_cast(
         n_people=None,
         mask_generator=None,        # STM generator for the global grid
         local_mask_generator=None,  # per-resolution STM generators, {'local_crops_32': gen, ...}
+        respect_validity=False,
+        patch_size=4,
+        max_mfp_tokens_per_view=0,
 ):
     """Stack crops and generate Semantic Tube Masks.
 
@@ -59,10 +62,30 @@ def collate_data_and_cast(
     random.shuffle(masks_list)  # decouple mask assignment from view order
     collated_masks = torch.stack(masks_list).flatten(1)
 
+    if respect_validity:
+        from slim.models.slim_v2 import patch_validity
+        valid = patch_validity(collated_global_crops, patch_size).flatten(1)
+        collated_masks &= valid
+        collated_output["global_usable"] = valid.any(1)
+        collated_output["global_patch_valid"] = valid
+        # Artificial masks hide the full drawn region. Only the prediction targets
+        # are subsampled, uniformly within each view, to bound the prototype head cost.
+        targets = collated_masks.clone()
+        if max_mfp_tokens_per_view:
+            for row in targets:
+                indices = row.nonzero().flatten()
+                if len(indices) > max_mfp_tokens_per_view:
+                    keep = indices[torch.randperm(len(indices))[:max_mfp_tokens_per_view]]
+                    row.zero_()
+                    row[keep] = True
+        collated_output["mfp_masks"] = targets
+    else:
+        targets = collated_masks
+
     # Metadata consumed by the MFP loss.
     collated_output["collated_masks"] = collated_masks
-    collated_output["mask_indices_list"] = collated_masks.flatten().nonzero().flatten()
-    collated_output["masks_weight"] = (1 / collated_masks.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(collated_masks)[collated_masks]
+    collated_output["mask_indices_list"] = targets.flatten().nonzero().flatten()
+    collated_output["masks_weight"] = (1 / targets.sum(-1).clamp(min=1.0)).unsqueeze(-1).expand_as(targets)[targets]
     collated_output["n_masked_patches"] = torch.full((1,), fill_value=collated_output["mask_indices_list"].shape[0], dtype=torch.long)
     collated_output["upperbound"] = upperbound
 
@@ -104,9 +127,22 @@ def collate_data_and_cast(
             collated_output[key_mask] = masks_stack
 
         else:
-            N_local = crops_stack.shape[2] * crops_stack.shape[3]  # T * V
+            if local_mask_generator is not None and key_crop in local_mask_generator:
+                lh, lw = local_mask_generator[key_crop].get_shape()
+                N_local = lh * lw
+            else:
+                N_local = crops_stack.shape[2] * crops_stack.shape[3]
             total_local_samples = len(crops_stack)
             masks_stack = torch.zeros((total_local_samples, N_local), dtype=torch.bool)
             collated_output[key_mask] = masks_stack
+
+        if respect_validity:
+            local_valid = patch_validity(crops_stack, patch_size).flatten(1)
+            collated_output[key_mask] &= local_valid
+            collated_output[key_crop.replace("crops", "usable")] = local_valid.any(1)
+            parent_key = key_crop.replace("crops", "parents")
+            collated_output[parent_key] = torch.tensor([
+                s[0][parent_key][i] for i in range(n_crops) for s in samples_list
+            ], dtype=torch.long)
 
     return collated_output

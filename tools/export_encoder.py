@@ -31,11 +31,14 @@ def export(src, dst, note=""):
     n_params = sum(v.numel() for v in backbone.values())
 
     payload = {"teacher": backbone}
+    if "encoder_config" in ckpt:
+        payload["encoder_config"] = ckpt["encoder_config"]
     if note:
         payload["note"] = note
     torch.save(payload, dst)
 
-    sha = hashlib.sha256(open(dst, "rb").read()).hexdigest()
+    with open(dst, "rb") as stream:
+        sha = hashlib.sha256(stream.read()).hexdigest()
     print(json.dumps({
         "src": src,
         "dst": dst,

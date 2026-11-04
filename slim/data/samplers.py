@@ -186,9 +186,12 @@ class ShardedInfiniteSampler(Sampler):
         )
 
     def __iter__(self):
-        iter_count = self._advance // self._sample_count
+        samples_per_cycle = self._sample_count // self._step if self._shuffle else len(range(self._start, self._sample_count, self._step))
+        if samples_per_cycle == 0:
+            raise ValueError("dataset must contain at least one sample per rank")
+        iter_count = self._advance // samples_per_cycle
         if iter_count > 0:
-            self._advance -= iter_count * self._sample_count
+            self._advance -= iter_count * samples_per_cycle
             self._iter_count += iter_count
 
         if self._shuffle:

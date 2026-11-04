@@ -47,6 +47,9 @@ class SLiMEncoder(DinoVisionTransformer):
 
     @classmethod
     def from_config(cls, config):
+        if config.get("arch") == "slim_v2":
+            from slim.models.slim_v2 import SlimV2Encoder
+            return SlimV2Encoder(**{k: v for k, v in config.items() if k != "arch"})
         cfg = {**DEFAULT_CONFIG, **config}
         if cfg.pop("arch", "vit_tiny") != "vit_tiny":
             raise ValueError("only the vit_tiny SLiM encoder is released")
@@ -102,9 +105,15 @@ def load_encoder_from_pth(path, config=None):
     """
     ckpt = torch.load(path, map_location="cpu")
     state = ckpt["teacher"] if "teacher" in ckpt else ckpt
-    state = {k.replace("backbone.", ""): v for k, v in state.items() if k.startswith("backbone.")}
-    model = SLiMEncoder.from_config(config or {})
-    missing, _ = model.load_state_dict(state, strict=False)
-    if missing:
-        raise RuntimeError(f"{path} is missing encoder weights: {missing[:5]}")
+    prefixed = {k.removeprefix("backbone."): v for k, v in state.items() if k.startswith("backbone.")}
+    state = prefixed or state
+    metadata = ckpt.get("encoder_config", {})
+    if metadata and config:
+        for key, value in config.items():
+            if key in metadata and metadata[key] != value:
+                raise ValueError(f"encoder config mismatch in {key}: {metadata[key]} vs {value}")
+    model = SLiMEncoder.from_config({**(config or {}), **metadata})
+    missing, unexpected = model.load_state_dict(state, strict=False)
+    if missing or unexpected:
+        raise RuntimeError(f"{path}: missing encoder weights {missing[:5]}; unexpected {unexpected[:5]}")
     return model

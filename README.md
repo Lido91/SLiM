@@ -1,3 +1,8 @@
+> **Sign-language fork:** this checkout includes RTMPose sign-data support and an
+> experimental hierarchical **SLiM Sign V2** (`student.arch: slim_v2`). V2 is a local
+> extension of the [original SLiM](https://github.com/KAIST-VICLab/SLiM), with a different encoder/checkpoint architecture.
+> See [SLiM Sign V2](#slim-sign-v2) for implementation, validation and commands.
+
 <div align="center">
 <h2>[NeurIPS 2026] Less is More: Compact-Token Masked Feature Prediction for Skeleton Representation Learning</h2>
 
@@ -95,7 +100,7 @@ Naming note: the code descends from DINOv2, so MFP is implemented in the iBOT pa
 ## Installation
 
 ```bash
-git clone https://github.com/KAIST-VICLab/SLiM.git
+git clone https://github.com/Lido91/SLiM.git
 cd SLiM
 conda create -n slim python=3.9 -y
 conda activate slim
@@ -418,3 +423,108 @@ This codebase is built upon [DINOv2](https://github.com/facebookresearch/dinov2)
 
 ## License
 Apache License 2.0, inherited from DINOv2. See [LICENSE](LICENSE).
+
+
+## SLiM Sign V2
+
+V2 retains the original sign69 data layout (body 9, left/right hands 21 each, face 18)
+and the 4-frame temporal patch. Its data flow is:
+
+```text
+[B, 3, 64, 69, 1] normalized pose + confidence
+  -> 16 x 69 joint embeddings (256 dimensions)
+  -> shared spatial attention within each part/time patch
+  -> learned query pooling: body 4, left hand 8, right hand 8, face 8
+  -> 16 x 28 = 448 summaries -> 8-layer global Transformer with temporal RoPE
+  -> global part context fused back into all 16 x 69 joint features
+  -> validity-aware, part-balanced joint pooling + CLS -> 256D downstream embedding
+```
+
+The 1,104 joint features remain available as `x_norm_patchtokens` for joint-level
+MFP; `x_norm_parttokens` contains the 448 summaries. Only summaries, CLS and four
+register tokens enter global attention. Four parts share a local attention block,
+processed in one padded batch; joint positions and part queries distinguish them.
+This retains a direct fine-feature path, but does **not** establish that compression
+is lossless or improves sign recognition. The existing 18 face points cover jaw,
+inner lips and nose tip; eyebrows/eye landmarks are not in this input layout.
+
+**Training.** An EMA teacher sees unmasked global crops. The student masks joint
+patches **before local spatial mixing**, so masked coordinates cannot leak through
+pooling. Detection validity excludes invalid coordinates from patch embedding,
+attention, pooling and MFP targets. Globals overlap by at least 50%; each local
+crop matches only its parent global, with crop-major sample identity preserved.
+The default V2 local crops are unmasked. Confidence-based validity remains distinct
+from artificial masking; a partially detected temporal patch is usable when at
+least one constituent frame contains a detected joint.
+
+The loss is `DINO + joint MFP/iBOT + 0.1 * KoLeo`. V2 uses stable fp32 distributed
+Sinkhorn and per-crop mean MFP, including ranks with no valid local targets.
+The default `ibot.max_mfp_tokens_per_view=128` uniformly samples up to 128 valid
+masked **joint prediction targets** per global view. All drawn masks remain hidden
+from the student, including masks not selected as targets. Set the budget to `0`
+for all-target supervision. This is an explicit stochastic supervision budget,
+not a change from joint-level targets to part-only targets. Gentler sign noise
+(`crops.noise_std=0.002`) is used in V2. V1 configs remain available.
+
+Pack OpenASL train as described above, then start a **new** output directory:
+
+```bash
+bash scripts/pretrain_sign_v2.sh outputs/slim_sign_v2_openasl 0,1,2,3   wandb.enabled=true wandb.project=SLiM wandb.name=slim_sign_v2_openasl
+```
+
+For a bounded smoke run, append `train.max_steps=20`; the learning-rate/teacher
+schedules still use the declared full training budget. Repeating the same command
+resumes the saved iteration, optimizer, scaler, per-rank RNG and sampler position.
+V2 guards the architecture, loss/crop settings, schedule, seed, batch, world size
+and store metadata fingerprints. Worker-prefetch augmentation state is not replayed
+bit-for-bit. V1 checkpoints cannot resume V2; use fresh pretraining for this encoder.
+The output/checkpoint format used by V1 is otherwise preserved.
+
+Teacher exports include `encoder_config`; `tools/export_encoder.py` preserves it:
+
+```bash
+python tools/export_encoder.py   outputs/slim_sign_v2_openasl/eval/training_12499/teacher_checkpoint.pth   checkpoints/slim_sign_v2.pth
+```
+
+```python
+from slim.hub import load_encoder_from_pth
+encoder = load_encoder_from_pth("checkpoints/slim_sign_v2.pth").eval().cuda()
+# clips: [B,3,T,69,1], with T divisible by 4
+embedding = encoder.forward_features(clips)["x_norm_embedding"]  # [B,256]
+```
+
+`slim.eval.wlasl_lora` automatically loads V2 metadata and uses this embedding for
+its BN + Linear classifier. Example using the existing test-as-dev diagnostic:
+
+```bash
+python -m slim.eval.wlasl_lora --checkpoint checkpoints/slim_sign_v2.pth   --pretrain-step 12500 --output-dir outputs/wlasl_lora_v2   --dev-split test --wandb-group wlasl-lora-v2
+```
+
+Use `slim/configs/eval/slim_sign_v2_eval.yaml` with the generic evaluation tools.
+`get_intermediate_layers` returns the context-fused joint features at selected
+global blocks. The dedicated WLASL classifier uses validity-aware V2 pooling;
+the older generic evaluation heads retain their own configured pooling.
+
+**Validation (2026-11-04).** 25 CPU unit checks pass, including pre-mixing mask
+isolation, missing-data/padding invariance, empty-target loss, EMA, sampler resume
+across ranks/epochs, configuration guards, checkpoint export/load and LoRA forward.
+Bounded real OpenASL GPU checks passed: one GPU for 2 updates then resume to 4;
+two GPUs for 2 updates. GPU checks used the full encoder and smaller prototype
+heads for smoke testing. No formal V2 pretraining or WLASL accuracy run has started.
+
+Single L40S compute benchmark on synthetic, already-collated crops: bf16, batch 16,
+2 globals + 8 locals, 2 warmup and
+7 timed updates; actual teacher/student, heads, backward, AdamW and EMA:
+
+| Encoder / supervision | Median step | Peak allocated GPU memory |
+| --- | ---: | ---: |
+| V1, all masked joint targets | 0.390 s | 11,592 MiB |
+| V2, all masked joint targets | 0.316 s | 8,827 MiB |
+| V2, default 128-target budget | 0.199 s | 5,772 MiB |
+
+The V2 default measured about **1.96x** compute throughput and **50%** less allocated
+memory. Architecture alone measured 1.23x with all-target supervision. Data loading,
+checkpoint I/O and multi-GPU scaling are excluded; shared-GPU load introduces timing
+noise. Batch 2 is dominated by overhead and did not improve in this short benchmark.
+This is implementation/performance evidence, not downstream-quality evidence.
+Reproduce with `python tools/benchmark_sign_v2.py --batch-size 16 --output /tmp/slim_v2_benchmark.json`.

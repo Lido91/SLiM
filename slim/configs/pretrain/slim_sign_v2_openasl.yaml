@@ -1,0 +1,33 @@
+# SLiM V2: hierarchical part attention with retained joint-level MFP.
+# Use a new output directory: V1 checkpoints are architecturally incompatible.
+# Only the *training* clips are used (no labels / text); dev and test stay unseen.
+# Everything not listed is inherited from slim/configs/default_config.yaml.
+train:
+  dataset_path: SignPose:root=./data/sign/OpenASL/train
+  batch_size_per_gpu: 64            # effective batch = 64 x n_gpus (LR follows the sqrt rule)
+ibot:
+  local_masking: false
+  max_mfp_tokens_per_view: 128       # uniform subset of valid masked joints; 0 predicts all
+  head_n_prototypes: 16384          # MFP prototypes; 65536 x 1104 masked-token logits does not fit
+student:
+  arch: slim_v2
+  v2:
+    part_tokens: [4, 8, 8, 8]       # body / left hand / right hand / face
+    local_depth: 1
+  patch_size:                       # (P_T, P_J): 64 frames x 69 joints -> 16 x 69 token grid
+  - 4
+  - 1
+crops:
+  skeleton: sign69                  # body 9 + hands 2 x 21 + face 18, see slim/data/skeletons.py
+  pose_norm: part                   # Uni-Sign normalisation (hands wrist-relative, face nose-relative)
+  min_global_overlap: 0.5
+  noise_std: 0.002                  # gentler coordinate noise for fingers and lips
+  max_window_frames: 128            # global views of long sentences come from one <=128-frame window
+  num_joints: 69
+  num_people: 1
+  global_crops_size:
+  - 64
+  - 69
+  local_crops_size:
+  - 16
+  - 69

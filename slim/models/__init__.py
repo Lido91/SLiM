@@ -13,6 +13,17 @@ logger = logging.getLogger("slim")
 
 def build_model(args, only_teacher=False, img_size=224):
     args.arch = args.arch.removesuffix("_memeff")
+    if args.arch == "slim_v2":
+        from .slim_v2 import SlimV2Encoder
+        options = dict(img_size=img_size, patch_size=args.patch_size, in_chans=args.in_chans,
+                       num_register_tokens=args.num_register_tokens,
+                       drop_path_rate=args.drop_path_rate, drop_path_uniform=args.drop_path_uniform,
+                       **dict(args.get("v2", {})))
+        teacher = SlimV2Encoder(**options)
+        if only_teacher:
+            return teacher, teacher.embed_dim
+        student = SlimV2Encoder(**options)
+        return student, teacher, student.embed_dim
     if "vit" in args.arch:
         vit_kwargs = dict(
             img_size=img_size,
@@ -35,6 +46,8 @@ def build_model(args, only_teacher=False, img_size=224):
             drop_path_uniform=args.drop_path_uniform,
         )
         embed_dim = student.embed_dim
+    else:
+        raise ValueError(f"unknown architecture: {args.arch}")
     return student, teacher, embed_dim
 
 

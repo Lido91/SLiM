@@ -7,7 +7,7 @@ __pycache__/
 .DS_Store
 
 # Data and experiment outputs (root-anchored: `data/` alone would also match slim/data/)
-/data/
+/data
 /outputs/
 /runs/
 *.log
